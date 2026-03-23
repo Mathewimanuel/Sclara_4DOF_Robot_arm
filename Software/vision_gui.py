@@ -9,13 +9,13 @@ OVERVIEW
 Desktop GUI that tracks a hand-mounted ArUco marker (ID 0) via a Logitech
 C920 camera, computes 3D hand position in the robot world frame, solves
 inverse kinematics across all 4 axes (BASE, SHOULDER, ELBOW, WRIST), and
-sends coordinated step commands to the ESP32 firmware at 10Hz over serial.
+sends coordinated step commands to the ESP32 firmware at 30Hz over serial.
 A separate MediaPipe pipeline measures pinch distance and maps it to gripper
 PWM in the same serial command.
 
 WINDOW LAYOUT
 -------------
-  Left   — Live camera feed (640×480 captured, 480×360 displayed)
+  Left   — Live camera feed (1280×960 captured, 960×720 displayed)
            Overlays: ArUco detection boxes, hand crosshair, XYZ readout,
            pinch mm→PWM label, speed banner, calibration prompts
   Centre — 3D arm preview (matplotlib, live at ~10fps)
@@ -51,7 +51,7 @@ SIGNAL PIPELINE (per frame, architecture §5.6)
        a. 3D velocity magnitude < 400mm/s (warn >250mm/s)
        b. IKResult.reachable == True
        c. Per-axis step delta < 150 steps (jerk limit)
- 12. Serial command sent at max 10Hz:  B:<n> S:<n> E:<n> W:<n> G:<n>
+ 12. Serial command sent at 30Hz:  B:<n> S:<n> E:<n> W:<n> G:<n>
 
 PINCH PIPELINE (per frame, architecture §5.5 + §5.6)
 ------------------------------------------------------
@@ -104,7 +104,7 @@ DEPENDENCIES
 
 FILES REQUIRED IN SAME DIRECTORY
 ----------------------------------
-    camera_calibration.pkl  — from checkerboard calibration at 640×480
+    camera_calibration.pkl  — from checkerboard calibration at 1280×960
     IKSolver.py             — exposes solve(), IKResult, arm_geometry()
 """
 
@@ -162,7 +162,7 @@ CALIB_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "camera_calibration.pkl")
 
 BAUD_RATE          = 115200
-UPDATE_RATE_HZ     = 10     # architecture spec §7.2 — max 10Hz serial commands
+UPDATE_RATE_HZ     = 30     # Phase 9: 30Hz matches camera rate for smooth tracking
 
 # ── Reference marker → IK world frame offset ─────────────────
 # Measure once: physical distance from ref marker centre to the
@@ -170,39 +170,46 @@ UPDATE_RATE_HZ     = 10     # architecture spec §7.2 — max 10Hz serial comman
 # +X = ref marker needs to move right to reach shoulder base
 # +Y = ref marker needs to move forward (toward arm) to reach shoulder base
 REF_OFFSET_X_MM =   0.0   # ← set after physical measurement
-REF_OFFSET_Y_MM =   250.0   # ← set after physical measurement
+REF_OFFSET_Y_MM =   320.0   # ← set after physical measurement
 REF_OFFSET_Z_MM =   0.0   # ← set if marker is raised off table (e.g. on a stand)
 
 
 # Hand marker position is mapped directly into IKSolver world frame.
 # These clamp the hand to a safe sub-volume of the full reachable space.
 WS_X_MIN = -300.0;  WS_X_MAX =  300.0   # mm left/right
-WS_Y_MIN =   80.0;  WS_Y_MAX =  425.0   # mm forward (FK max ~427mm at SH=90 EL=-110)
-WS_Z_MIN =   20.0;  WS_Z_MAX =  415.0   # mm up (FK max ~417mm at SH=0 EL=-114)
+WS_Y_MIN =  210.0;  WS_Y_MAX =  425.0   # mm forward (arm min ~215mm at IK zero)
+WS_Z_MIN =   20.0;  WS_Z_MAX =  405.0   # mm up (FK max ~405mm at SH=0 EL=-115)
+
+# Jog slider hard limits — physical arm capability, never overridden by aruco_config.json
+SLIDER_X_MIN = -300.0;  SLIDER_X_MAX =  300.0
+SLIDER_Y_MIN =  210.0;  SLIDER_Y_MAX =  425.0
+SLIDER_Z_MIN =   20.0;  SLIDER_Z_MAX =  405.0
 
 # ── Dead band (architecture spec §6.5) ───────────────────────
 # Applied in hand space BEFORE scaling — guarantees same physical
 # hand movement threshold regardless of scale factor.
-DEADBAND_MM        =  8.0   # mm — position must move this far from last sent
+DEADBAND_MM        =  1.0   # mm — at 30Hz hand moves 1.67mm/frame at 50mm/s; 1mm passes slow movements
 # Gripper dead band: 5 degrees servo equivalent
 # pulse range = 1600µs over 180 degrees → 5° = 44µs
 DEADBAND_GRIPPER_US = round(5 / 180 * 1600)   # = 44 µs
 
 
-MAX_SPEED_3D    = 400.0   # mm/s  — 3D velocity magnitude; suppress above this
+MAX_SPEED_3D    = 150.0   # mm/s  — 3D velocity magnitude; suppress above this
 
 # §9 Speed matching — hand velocity → V: field in serial command
 SPEED_MATCH_ENABLED  = True   # False → always send V:100 (full speed)
 SPEED_MATCH_MIN      = 15     # % floor — arm speed when hand barely moves past deadband
 SPEED_MATCH_MAX      = 100    # % ceiling — arm speed when hand hits HAND_MAX_SPEED_MMS
-HAND_MAX_SPEED_MMS   = 70.0  # mm/s — hand speed that maps to SPEED_MATCH_MAX
+HAND_MAX_SPEED_MMS   = 70.0
+CATCHUP_SPEED        = 75    # % — V: used during initial catch-up (arm closing gap to hand)
+PINCH_RATE_HZ        = 10    # Hz — MediaPipe runs at this rate (neural net is expensive)  # mm/s — hand speed that maps to SPEED_MATCH_MAX
                                # Set to your realistic top-end hand speed, NOT the safety cutoff
                                # Speeds above this still clamp to SPEED_MATCH_MAX (no harm)
 WARNING_SPEED   = 50.0   # mm/s  — show warning above this
 MAX_STEP_JUMP   = 150     # steps — max per-axis delta per command (jerk limit)
 
 # §8.1 Trajectory spline smoother
-TRAJ_BUFFER_N   =   15     # number of positions to fit spline through (tune: more=smoother/laggier)
+TRAJ_BUFFER_N   =    5     # number of positions to fit spline through — 5 at 30fps = 167ms window
 TRAJ_MIN_SPAN   =   0.08  # seconds — minimum time span in buffer before spline fires
 
 # ── Pinch detection (MediaPipe) ───────────────────────────────
@@ -219,9 +226,9 @@ GRIPPER_MAX_PWM = 2500   # µs — fully closed
 
 MEDIAN_WINDOW      = 1     # hand marker: OEF handles all smoothing; median=1 is intentional pass-through
 REF_MEDIAN_WINDOW  = 3     # ref marker tvec/rvec spike rejection (3 frames ≈ 100ms at 30fps)
-ONE_EURO_FREQ      = 20.0
+ONE_EURO_FREQ      = 30.0   # match camera frame rate — filter was miscalibrated at 20Hz
 ONE_EURO_MINCUTOFF = 0.5
-ONE_EURO_BETA      = 0.5
+ONE_EURO_BETA      = 1.5   # raised from 0.5 — faster response on fast hand movements
 ONE_EURO_DCUTOFF   = 1.0
 
 # §5.6 Pinch filter — separate params per architecture spec
@@ -244,9 +251,9 @@ JOG_SIZES = [1, 5, 10, 25, 50]   # mm step options
 JOG_AXIS_COLORS = {"X": "#ff6666", "Y": "#66ff88", "Z": "#6699ff"}
 JOG_PRESETS = [
     # label,       x,      y,      z
-    ("IK ZERO",   0.0,  230.5,  191.4),
-    ("MAX FWD",   0.0,  427.1,   60.6),
-    ("MAX HIGH",  0.0,  250.1,  417.1),
+    ("IK ZERO",   0.0,  215.9,  174.1),
+    ("MAX FWD",   0.0,  414.9,   41.9),
+    ("MAX HIGH",  0.0,  253.4,  397.0),
     ("NEAR TBL",  0.0,  304.4,   40.0),
     ("LEFT 45", -222.1,  222.1,  218.1),
     ("RIGHT 45",222.1, 222.1,  218.1),
@@ -271,34 +278,18 @@ _CONFIG_KEYS = {
     "WS_Y_MAX":            "float",
     "WS_Z_MIN":            "float",
     "WS_Z_MAX":            "float",
-    "DEADBAND_MM":         "float",
-    "MAX_SPEED_3D":        "float",
-    "WARNING_SPEED":       "float",
-    "SPEED_MATCH_ENABLED":  "int",
-    "SPEED_MATCH_MIN":      "int",
-    "SPEED_MATCH_MAX":      "int",
-    "HAND_MAX_SPEED_MMS":   "float",
-    "MAX_STEP_JUMP":       "int",
-    "PINCH_CLOSED_MM":     "float",
-    "PINCH_OPEN_MM":       "float",
-    "GRIPPER_MIN_PWM":     "int",
-    "GRIPPER_MAX_PWM":     "int",
     "ONE_EURO_MINCUTOFF":  "float",
     "ONE_EURO_BETA":       "float",
-    "PINCH_OEF_MINCUTOFF": "float",
-    "PINCH_OEF_BETA":      "float",
-    "UPDATE_RATE_HZ":      "int",
+    "GRIPPER_MIN_PWM":     "int",
+    "GRIPPER_MAX_PWM":     "int",
 }
 
 def load_config():
     """Load module-level constants from aruco_config.json at import time."""
     global REF_OFFSET_X_MM, REF_OFFSET_Y_MM, REF_OFFSET_Z_MM
     global WS_X_MIN, WS_X_MAX, WS_Y_MIN, WS_Y_MAX, WS_Z_MIN, WS_Z_MAX
-    global DEADBAND_MM, MAX_SPEED_3D, WARNING_SPEED, MAX_STEP_JUMP
-    global SPEED_MATCH_ENABLED, SPEED_MATCH_MIN, SPEED_MATCH_MAX, HAND_MAX_SPEED_MMS
-    global PINCH_CLOSED_MM, PINCH_OPEN_MM, GRIPPER_MIN_PWM, GRIPPER_MAX_PWM
-    global ONE_EURO_MINCUTOFF, ONE_EURO_BETA, PINCH_OEF_MINCUTOFF, PINCH_OEF_BETA
-    global UPDATE_RATE_HZ
+    global ONE_EURO_MINCUTOFF, ONE_EURO_BETA
+    global GRIPPER_MIN_PWM, GRIPPER_MAX_PWM
 
     if not os.path.exists(CONFIG_FILE):
         return
@@ -330,7 +321,6 @@ FG_TX    = "#557755"
 
 FONT_MONO = ("Courier New", 10)
 FONT_HEAD = ("Courier New", 12, "bold")
-FONT_BIG  = ("Courier New", 36, "bold")
 FONT_TINY = ("Courier New",  8)
 
 
@@ -630,7 +620,7 @@ class PinchDetector:
         # Label shows real mm and PWM
         mid = ((t[0] + i[0]) // 2, (t[1] + i[1]) // 2 - 12)
         cv2.putText(frame, f"{self.pinch_mm:.0f}mm → G:{self.gripper_pwm}",
-                    mid, cv2.FONT_HERSHEY_SIMPLEX, 0.4, tip_col, 1)
+                    mid, cv2.FONT_HERSHEY_SIMPLEX, 0.8, tip_col, 2)
 
     def update_filter_params(self, median_n, oef_freq, oef_mincutoff, oef_beta, oef_dcutoff):
         """Public method to rebuild pinch filters with new parameters."""
@@ -657,7 +647,17 @@ class SerialManager:
 
     def connect(self, port):
         try:
-            self.ser = serial.Serial(port, BAUD_RATE, timeout=0.1)
+            # Open port without activating DTR/RTS — prevents ESP32 reset on connect.
+            # Must open with baudrate=0 first to prevent DTR pulse, then set baud.
+            # DTR pulse happens at the moment Serial() is called — setting dtr=False
+            # after open is too late on CH340/CP2102 chips.
+            self.ser = serial.Serial()
+            self.ser.port     = port
+            self.ser.baudrate = BAUD_RATE
+            self.ser.timeout  = 0.1
+            self.ser.dtr      = False   # set BEFORE open — no reset pulse
+            self.ser.rts      = False   # set BEFORE open — no GPIO13 interference
+            self.ser.open()
             self._running = True
             self._thread  = threading.Thread(target=self._read_loop, daemon=True)
             self._thread.start()
@@ -717,9 +717,18 @@ class VisionGUI:
         self.root.minsize(1440, 720)
 
         self.serial    = SerialManager(self.on_rx)
-        self.connected = False
-        self.homing    = False
+        self.connected       = False
+        self._expecting_boot  = False   # True after connect — suppress duplicate BOOT: prompt
         self._hand_tracked = False   # updated each camera frame; guards stale _clear_tracking calls
+
+        # ── Phase 9: camera→main thread shared state ──────────────────────────
+        # Camera thread writes, main thread reads. GIL protects simple assignments.
+        self._latest_xyz          = None   # filtered hand position (mm) from camera thread
+        self._latest_tilt         = 0.0    # marker tilt angle (degrees)
+        self._latest_hand_visible = False  # hand marker detected in last frame
+        self._latest_frame        = None   # ImageTk.PhotoImage ready to display
+        self._latest_ids_present  = []     # detected marker IDs for display
+        self._display_tick        = 0      # counter for 10Hz sub-tasks within 30Hz timer
 
         self.tracker   = None
         self._load_tracker()
@@ -734,8 +743,8 @@ class VisionGUI:
         self.enabled       = False
         self._manual_mode  = False     # Phase 5: when True, jog panel controls arm; vision sends suppressed
         self._jog_x        = 0.0      # current jog target in IK world mm
-        self._jog_y        = 230.5
-        self._jog_z        = 191.4
+        self._jog_y        = 215.9
+        self._jog_z        = 174.1
         self._jog_result   = None     # last IKResult from jog solve
         self.current_pos   = None      # (x_mm, y_mm, z_mm) world frame
         self.current_speed = 0.0       # mm/s 3D magnitude
@@ -744,7 +753,8 @@ class VisionGUI:
         self.last_steps    = None      # (b, s, e, w) last sent steps
         self.command_count = 0
         self.last_send_t        = 0.0
-        self._preset_move_until = 0.0   # keepalive blocked until preset move completes
+        self._preset_move_until  = 0.0   # keepalive fallback timeout for preset moves
+        self._preset_move_is_done = True   # True = keepalive allowed; False = preset in progress
         self._last_cmd_str  = ""      # last TX string — read by _update_displays at 10Hz
         self._3d_last_draw  = 0.0     # timestamp of last 3D preview redraw
         self.suppress_reason = ""      # why last command was suppressed
@@ -818,14 +828,45 @@ class VisionGUI:
     # ── Tracker init ─────────────────────────────────────────
 
     def _schedule_display_timer(self):
-        """Recurring 10Hz timer that drives all GUI widget updates.
-        Also sends keepalives so the firmware watchdog doesn't fire when:
-        - hand marker is not visible (manual mode, hand put down)
-        - commands suppressed for any reason but Python is still connected
-        Keepalive is independent of camera thread and hand visibility.
+        """Phase 9: 30Hz timer — main thread control loop.
+
+        Every tick (33ms):
+          - Show latest camera frame (no queue, reads _latest_frame directly)
+          - Run IK + send serial command if hand visible and tracking active
+          - Send keepalive if needed
+
+        Every 3rd tick (10Hz):
+          - Update all GUI widgets (joint angles, speed, reach, stats)
+          - Update 3D arm preview
+
+        Separating display (30Hz) from heavy widget updates (10Hz) keeps
+        the GUI responsive without overloading Tkinter at 30Hz.
         """
-        self._update_displays()
-        self._send_keepalive(time.time())
+        t = time.time()
+        self._display_tick += 1
+
+        # ── Camera frame — always, every tick ────────────────────────
+        if self._latest_frame is not None:
+            self._update_cam_label(self._latest_frame)
+
+        # ── IK + serial — every tick if hand visible ─────────────────
+        if self._latest_hand_visible and self._latest_xyz is not None:
+            self._ids_present = self._latest_ids_present
+            self._run_control(self._latest_xyz, self._latest_tilt, t)
+        elif not self._latest_hand_visible:
+            # Hand lost — handle state + keepalive
+            self._on_hand_lost(t)
+
+        # ── Keepalive — every tick (method gates on 400ms interval) ──
+        self._send_keepalive(t)
+
+        # ── Widget updates + 3D — every 3rd tick (10Hz) ──────────────
+        if self._display_tick % 3 == 0:
+            self._ids_present = self._latest_ids_present
+            self._update_displays()
+            if self.current_pos is not None and self.last_result is not None:
+                self._update_3d_plot(self.last_result, self.current_pos)
+
         self._display_timer_id = self.root.after(
             int(1000 / UPDATE_RATE_HZ), self._schedule_display_timer)
 
@@ -891,11 +932,31 @@ class VisionGUI:
                   command=self._home_all).pack(side="left", padx=(12, 0))
 
     def _build_statusbar(self):
+        bar = tk.Frame(self.root, bg=BG)
+        bar.pack(fill="x")
+
         self.status_var = tk.StringVar(value="● DISCONNECTED")
         self.status_lbl = tk.Label(
-            self.root, textvariable=self.status_var,
+            bar, textvariable=self.status_var,
             bg=BG, fg=FG_ERR, font=FONT_MONO, anchor="w", padx=12)
-        self.status_lbl.pack(fill="x")
+        self.status_lbl.pack(side="left", fill="x", expand=True)
+
+        # YES/NO home prompt buttons — hidden until connect
+        self._home_yes_btn = tk.Button(
+            bar, text="✔ YES — HOME", bg="#003300", fg="#00ff88",
+            font=FONT_MONO, relief="flat", padx=10, cursor="hand2",
+            state="disabled", command=self._home_confirm_yes)
+        self._home_yes_btn.pack(side="right", padx=(0, 4))
+
+        self._home_no_btn = tk.Button(
+            bar, text="✖ NO — SKIP", bg="#330000", fg="#ff4444",
+            font=FONT_MONO, relief="flat", padx=10, cursor="hand2",
+            command=self._home_confirm_no)
+        self._home_no_btn.pack(side="right", padx=(0, 4))
+
+        # Hide both initially
+        self._home_yes_btn.pack_forget()
+        self._home_no_btn.pack_forget()
 
     def _build_main_area(self):
         main = tk.Frame(self.root, bg=BG)
@@ -937,7 +998,6 @@ class VisionGUI:
 
         self._build_control_panel(right)
         self._build_jog_panel(right)
-        self._build_monitor_panel(right)
 
         # Centre: 3D preview (fixed width)
         centre = tk.Frame(main, bg=BG, width=420)
@@ -949,18 +1009,26 @@ class VisionGUI:
         left = tk.Frame(main, bg=BG)
         left.pack(side="left", fill="both", expand=True)
         self._build_camera_panel(left)
+        self._build_monitor_panel(left)
 
     def _build_camera_panel(self, parent):
         frame = tk.LabelFrame(parent, text=" CAMERA FEED ",
                                bg=BG2, fg=FG, font=FONT_HEAD,
                                relief="solid", bd=1)
-        frame.pack(fill="x", pady=4)
+        frame.pack(fill="x", pady=4, side="top")
 
         self.cam_label = tk.Label(frame, bg=BG3,
                                    text="Camera not started",
-                                   fg=FG_DIM, font=FONT_MONO,
-                                   width=480, height=360)
+                                   fg=FG_DIM, font=FONT_MONO)
         self.cam_label.pack(padx=4, pady=4)
+
+        # Track available panel width so _update_cam_label can resize correctly
+        self._cam_panel_w = 960
+        def _on_cam_frame_resize(event):
+            w = event.width - 8   # subtract padx
+            if w > 10:
+                self._cam_panel_w = w
+        frame.bind("<Configure>", _on_cam_frame_resize)
 
         # Camera controls bar
         ctrl = tk.Frame(frame, bg=BG2, pady=4)
@@ -1093,7 +1161,7 @@ class VisionGUI:
 
     def _draw_idle_pose(self):
         """Set persistent artists to IK-zero pose on startup."""
-        geom = arm_geometry(0, 0, 0, 0, 183.5, 191.4)
+        geom = arm_geometry(0, 0, 0, 0, 215.9, 174.1)
         self._set_arm_artists(geom, None, None, None, status="IK ZERO")
         self._3d_canvas.draw_idle()
 
@@ -1123,7 +1191,7 @@ class VisionGUI:
         # Semi-transparent dark banner at top
         cv2.rectangle(display, (0, 0), (w, 80), (0, 0, 0), -1)
         cv2.putText(display, "ALIGN REF MARKER (ID 10) — PRESS SPACE TO CONFIRM",
-                    (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 100), 1)
+                    (10, 56), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (200, 200, 100), 2)
 
         # Ghost outline — expected ref marker size and position
         # Draw a square showing where the marker should sit
@@ -1145,7 +1213,7 @@ class VisionGUI:
 
         if REFERENCE_ID not in poses:
             cv2.putText(display, "Ref marker not detected — show ID 10 to camera",
-                        (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 255), 1)
+                        (10, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (100, 100, 255), 2)
             self._align_ok      = False
             self._align_pos_err = None
             self._align_rot_err = None
@@ -1157,7 +1225,7 @@ class VisionGUI:
         my = int(corners[:, 1].mean())
 
         # Position error in pixels, convert to approximate mm
-        # At typical table distance (~500mm), 1px ≈ 0.5mm for C920 at 640×480
+        # At typical table distance (~500mm), 1px ≈ 0.63mm for C920 at 1280×960 (full FOV)
         PIX_PER_MM = 1.6   # rough estimate; good enough for alignment guide
         pos_err_px = float(np.sqrt((mx - cx_target)**2 + (my - cy_target)**2))
         pos_err_mm = pos_err_px / PIX_PER_MM
@@ -1189,15 +1257,15 @@ class VisionGUI:
         if rot_err_deg > 3.0:
             label_rot = f"ROTATE {rot_err_deg:.0f}deg"
             cv2.putText(display, label_rot, (mx + 10, my + 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 180, 255), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 180, 255), 2)
 
         # Error readouts
         pos_col = (0, 255, 136) if pos_err_mm < 5.0 else (0, 180, 255)
         rot_col = (0, 255, 136) if rot_err_deg < 3.0 else (0, 180, 255)
         cv2.putText(display, f"pos err: {pos_err_mm:.1f}mm",
-                    (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.45, pos_col, 1)
+                    (10, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.9, pos_col, 2)
         cv2.putText(display, f"rot err: {rot_err_deg:.1f}deg",
-                    (170, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.45, rot_col, 1)
+                    (340, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.9, rot_col, 2)
 
         # ALIGNED banner
         if self._align_ok:
@@ -1395,21 +1463,21 @@ class VisionGUI:
 
         tk.Frame(inner, bg=FG_DIM, height=1).pack(fill="x", pady=4)
 
-        # ── Verification points ───────────────────────────────────
-        tk.Label(inner, text="VERIFICATION POINTS", bg=BG2, fg=FG_DIM,
-                 font=FONT_TINY).pack(anchor="w")
+        # ── Presets — set sliders, user confirms with SEND ───────────
+        tk.Label(inner, text="PRESETS  (sets sliders — press SEND to move)",
+                 bg=BG2, fg=FG_DIM, font=FONT_TINY).pack(anchor="w")
         vrow = tk.Frame(inner, bg=BG2)
         vrow.pack(fill="x", pady=(2, 0))
         _vpts = [
-            ("IK ZERO",  "B:0 S:0 E:0 W:0 G:0"),
-            ("MAX FWD",  "B:0 S:1000 E:-306 W:-18 G:0"),
-            ("MAX HIGH", "B:0 S:0 E:-317 W:-101 G:0"),
+            ("IK ZERO",  0.0,  215.9, 174.1),
+            ("MAX FWD",  0.0,  414.9,  41.9),
+            ("MAX HIGH", 0.0,  253.4, 397.0),
         ]
-        for label, cmd in _vpts:
+        for label, px, py, pz in _vpts:
             tk.Button(vrow, text=label,
                       bg="#0a1a0a", fg="#88ff88", font=FONT_TINY,
                       relief="flat", padx=6, pady=3, cursor="hand2",
-                      command=lambda c=cmd: self._send_verification(c)
+                      command=lambda x=px, y=py, z=pz: self._jog_preset(x, y, z)
                       ).pack(side="left", padx=(0, 4))
 
         tk.Frame(inner, bg=FG_DIM, height=1).pack(fill="x", pady=4)
@@ -1440,6 +1508,10 @@ class VisionGUI:
             ("WS Y max",  "WS_Y_MAX"),
             ("WS Z min",  "WS_Z_MIN"),
             ("WS Z max",  "WS_Z_MAX"),
+            ("OEF cutoff","ONE_EURO_MINCUTOFF"),
+            ("OEF beta",  "ONE_EURO_BETA"),
+            ("GRP min µs","GRIPPER_MIN_PWM"),
+            ("GRP max µs","GRIPPER_MAX_PWM"),
         ]
         self._cfg_vars = {}   # name → StringVar
         for label, key in _cfg_fields:
@@ -1498,8 +1570,8 @@ class VisionGUI:
 
         # ── XYZ numeric entries ───────────────────────────────
         self._jog_vars = {}
-        xyz_defaults = {"X": 0.0, "Y": 230.5, "Z": 191.4}
-        xyz_ranges    = {"X": (-300, 300), "Y": (80, 425), "Z": (20, 415)}
+        xyz_defaults = {"X": 0.0, "Y": 215.9, "Z": 174.1}
+        xyz_ranges    = {"X": (SLIDER_X_MIN, SLIDER_X_MAX), "Y": (SLIDER_Y_MIN, SLIDER_Y_MAX), "Z": (SLIDER_Z_MIN, SLIDER_Z_MAX)}
         for axis in ("X", "Y", "Z"):
             color = JOG_AXIS_COLORS[axis]
             lo, hi = xyz_ranges[axis]
@@ -1599,6 +1671,23 @@ class VisionGUI:
         tk.Label(inner, textvariable=self._jog_serial_var,
                  bg=BG2, fg=FG_TX, font=FONT_TINY).pack(anchor="w", pady=(0, 6))
 
+        # ── Raw serial command entry ──────────────────────────
+        tk.Label(inner, text="RAW CMD  (overrides sliders when filled)",
+                 bg=BG2, fg=FG_DIM, font=FONT_TINY).pack(anchor="w", pady=(8,0))
+        raw_row = tk.Frame(inner, bg=BG2)
+        raw_row.pack(fill="x", pady=(2, 6))
+        self._raw_cmd_var = tk.StringVar()
+        self._raw_cmd_entry = tk.Entry(
+            raw_row, textvariable=self._raw_cmd_var,
+            bg=BG3, fg=FG, font=FONT_MONO,
+            insertbackground=FG, relief="flat")
+        self._raw_cmd_entry.pack(side="left", fill="x", expand=True)
+        tk.Button(raw_row, text="CLR", bg=BG3, fg=FG_DIM,
+                  font=FONT_TINY, relief="flat", padx=6, cursor="hand2",
+                  command=lambda: self._raw_cmd_var.set("")).pack(side="left", padx=(4,0))
+        # Bind Enter key to send
+        self._raw_cmd_entry.bind("<Return>", lambda e: self._jog_send())
+
         self._jog_send_btn = tk.Button(
             inner, text="▶  SEND TO ARM",
             bg="#004400", fg=FG, font=("Courier New", 11, "bold"),
@@ -1634,7 +1723,7 @@ class VisionGUI:
 
     def _jog(self, axis: str, direction: int):
         step = self._jog_step.get() * direction
-        ranges = {"X": (-300, 300), "Y": (80, 425), "Z": (20, 415)}
+        ranges = {"X": (-300, 300), "Y": (210, 425), "Z": (20, 415)}
         lo, hi = ranges[axis]
         var = self._jog_vars[axis]
         var.set(round(max(lo, min(hi, var.get() + step)), 1))
@@ -1683,13 +1772,30 @@ class VisionGUI:
             self.current_pos = (x, y, z)
 
     def _jog_send(self):
-        """Send current jog IK result to the arm immediately."""
+        """Send current jog IK result (or raw command) to the arm.
+        If the raw command entry is filled, sends that directly.
+        Otherwise uses the IK slider result with P:1 preset flag.
+        """
         if not self._manual_mode:
             self._log("Manual mode is OFF — enable it before sending jog commands.", "warn")
             return
         if not self.connected:
             self._log("Not connected — cannot send jog command.", "err")
             return
+
+        # ── Raw command override ──────────────────────────────────
+        raw = self._raw_cmd_var.get().strip()
+        if raw:
+            if self.serial.send(raw):
+                self._log(f"RAW → {raw}", "ok")
+                self._monitor_line(f"→ RAW {raw}", "tx")
+                self.last_send_t = time.time()
+                self.last_steps  = None   # clear jerk reference — arm moved to unknown position
+            else:
+                self._log("Failed to send raw command.", "err")
+            return
+
+        # ── IK slider path ────────────────────────────────────────
         if self._jog_result is None:
             return
         if not self._jog_result.reachable:
@@ -1698,14 +1804,15 @@ class VisionGUI:
 
         # No jerk limit here — manual presets are intentional large moves.
         # The firmware handles them with full trapezoidal ramping.
-        # Jerk limiting only applies to 10Hz vision streaming (in _update_tracking).
+        # Jerk limiting only applies to vision streaming — not manual jog presets.
         g = self._pinch.gripper_pwm if self._pinch else 900
-        cmd = f"{self._jog_result.serial_string()} G:{g}"
+        cmd = f"{self._jog_result.serial_string()} G:{g} P:1"
         if self.serial.send(cmd):
             self._log(f"JOG → {cmd}", "ok")
             self._monitor_line(f"→ JOG {cmd}", "tx")
             now = time.time()
-            self.last_send_t = now   # reset watchdog clock from jog send
+            self.last_send_t = now          # reset watchdog clock from jog send
+            self._preset_move_is_done = False  # block keepalive until DONE: or timeout
 
             # Estimate move duration so keepalive doesn't interrupt the ramp.
             # Two components:
@@ -1786,20 +1893,18 @@ class VisionGUI:
         if applied:
             self._log("Config applied (not saved): " + "  ".join(applied), "ok")
             self._log("Press SAVE CFG to persist to aruco_config.json.", "info")
+            # Rebuild filters so new ONE_EURO_BETA/MINCUTOFF take effect immediately
+            self._apply_filter_params()
         if errors:
             self._log(f"Invalid values (not applied): {', '.join(errors)}", "warn")
 
-    def _send_verification(self, cmd):
-        """Send a raw verification command directly, bypassing IK and state machine."""
-        if not self._manual_mode:
-            self._log("Manual mode is OFF — enable it before sending verification commands.", "warn")
-            return
-        if not self.connected:
-            self._log("Not connected.", "err")
-            return
-        if self.serial.send(cmd):
-            self._log(f"VERIFY: {cmd}", "info")
-            self.root.after(0, self._update_stats, cmd)
+    def _jog_preset(self, x, y, z):
+        """Set XYZ sliders to a named preset position. User presses SEND to move."""
+        self._jog_vars["X"].set(round(x, 1))
+        self._jog_vars["Y"].set(round(y, 1))
+        self._jog_vars["Z"].set(round(z, 1))
+        self._jog_solve()
+        self._log(f"Preset loaded → X:{x:.1f} Y:{y:.1f} Z:{z:.1f}mm  (press SEND to move)", "info")
 
     def _build_monitor_panel(self, parent):
         frame = tk.LabelFrame(parent, text=" SERIAL MONITOR ",
@@ -1826,26 +1931,8 @@ class VisionGUI:
 
         self._monitor_lines = 0
 
-        ctrl = tk.Frame(frame, bg=BG2, padx=4, pady=2)
-        ctrl.pack(fill="x")
-        tk.Button(ctrl, text="Clear", bg=BG2, fg=FG_DIM,
-                  font=FONT_TINY, relief="flat", cursor="hand2",
-                  command=self._clear_monitor).pack(side="left")
 
-        # Send bar
-        send = tk.Frame(frame, bg=BG2, padx=4, pady=4)
-        send.pack(fill="x")
-        tk.Label(send, text="TX:", bg=BG2, fg=FG_DIM,
-                 font=FONT_MONO).pack(side="left")
-        self.raw_var = tk.StringVar()
-        ent = tk.Entry(send, textvariable=self.raw_var,
-                       bg=BG3, fg=FG, insertbackground=FG,
-                       font=FONT_MONO, relief="flat")
-        ent.pack(side="left", fill="x", expand=True, padx=4)
-        ent.bind("<Return>", lambda _: self._send_raw_entry())
-        tk.Button(send, text="SEND", bg="#002200", fg=FG,
-                  font=FONT_MONO, relief="flat", cursor="hand2",
-                  command=self._send_raw_entry).pack(side="right")
+
 
     # ═══════════════════════════════════════════════════════
     # CAMERA LOOP
@@ -1872,20 +1959,22 @@ class VisionGUI:
                 text="Camera index 0 not found", image=""))
             return
 
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 960)
         self._cam_running = True
         threading.Thread(target=self._cam_loop, daemon=True).start()
 
     def _cam_loop(self):
-        # Warm-up: DirectShow needs a few grabs before delivering real frames.
-        # Done here in the thread so the main thread (and GUI) never blocks.
+        """Phase 9: camera thread does ONLY vision processing.
+        Results stored to _latest_* shared vars — no serial sends, no widget touches.
+        Display timer (30Hz, main thread) reads these and drives IK + serial + GUI.
+        """
         for _ in range(5):
-            self.cap.read()
+            self.cap.read()   # DirectShow warm-up
 
         _consecutive_failures = 0
         while self._cam_running:
-            _frame_start = time.perf_counter()   # §7.3 deadline timing
+            _frame_start = time.perf_counter()
             ret, frame = self.cap.read()
             if not ret:
                 _consecutive_failures += 1
@@ -1896,61 +1985,52 @@ class VisionGUI:
                 continue
             _consecutive_failures = 0
 
-            frame = cv2.flip(frame, 1)
+            frame   = cv2.flip(frame, 1)
             display = frame.copy()
 
-            # ── Pinch detection (runs on every frame) ─────────────
-            # ── Pinch detection throttled to 10Hz (MediaPipe neural net is expensive)
+            # ── Pinch detection (throttled to 10Hz — MediaPipe neural net) ───
             _now_p = time.perf_counter()
-            if _now_p - self._pinch_last_t >= 1.0 / UPDATE_RATE_HZ:
+            if _now_p - self._pinch_last_t >= 1.0 / PINCH_RATE_HZ:
                 self._pinch.process(frame)
                 self._pinch_last_t = _now_p
-            self._pinch.draw_overlay(display)  # always draw last result
+            self._pinch.draw_overlay(display)
 
             if self._tracker_ok:
                 poses = self.tracker.detect(frame)
 
-                # §4.3 — Alignment phase: draw overlay, block hand tracking
                 if self._align_state == "ALIGNING":
                     self._draw_alignment_overlay(display, poses)
-                    # Still update ref extrinsics so world frame is ready on confirm
                     if REFERENCE_ID in poses:
                         self.tracker.update_extrinsics(poses[REFERENCE_ID])
-                    # Skip hand tracking until aligned
-                    self._ids_present = list(poses.keys())   # read by _update_displays
+                    self._latest_ids_present = list(poses.keys())
 
                 else:
-                    # §3.2 — update world transform whenever ref is visible
+                    # §3.2 — update world frame from ref marker
                     if REFERENCE_ID in poses:
                         self.tracker.update_extrinsics(poses[REFERENCE_ID])
 
-                        # Ref marker drift check — warn if marker moved after calibration
+                        # Ref marker drift check
                         if (self._calib_state == "DONE" and
                                 self._calib_R_wc is not None and
                                 self._calib_t_wc is not None and
                                 self.tracker.R_wc is not None):
-                            # Rotation drift: Frobenius norm on R_wc change (~8° threshold)
                             r_diff = np.linalg.norm(
                                 self.tracker.R_wc - self._calib_R_wc, 'fro')
-                            # Translation drift: direct t_wc comparison (20mm threshold)
-                            # (Previously t_snap used R@inv(R)@t = -t, which is always
-                            # just the current t_wc — completely ignoring calib snapshot)
                             t_diff = np.linalg.norm(
                                 self.tracker.t_wc.flatten() - self._calib_t_wc)
-                            if r_diff > 0.15 or t_diff > 0.020:   # ~8° rotation OR 20mm shift
+                            if r_diff > 0.15 or t_diff > 0.020:
                                 self.root.after(0, self._log,
                                     "⚠ Ref marker may have moved since calibration — "
                                     "recalibrate for accurate mapping.", "warn")
-                                # Re-snap to avoid spamming the warning every frame
                                 self._calib_R_wc = self.tracker.R_wc.copy()
                                 self._calib_t_wc = self.tracker.t_wc.flatten().copy()
 
-                    # Draw all detected markers
+                    # Draw markers
                     for mid, pose in poses.items():
                         cv2.aruco.drawDetectedMarkers(
                             display, [pose["corners"]], np.array([[mid]]))
 
-                    tracking = False
+                    hand_visible = False
                     if HAND_ID in poses and self.tracker.R_wc is not None:
                         hand_corners = poses[HAND_ID]["corners"][0]
                         self._pinch.update_aruco_ruler(hand_corners)
@@ -1963,244 +2043,212 @@ class VisionGUI:
                             rvec = poses[HAND_ID]["rvec"]
                             R_cm, _ = cv2.Rodrigues(rvec)
                             marker_normal = R_cm[:, 2]
-                            # Tilt relative to world horizontal (not camera axis).
-                            # World up = R_wc @ [0,0,1] — derived from ref marker,
-                            # so "flat on table" = 0° regardless of camera angle.
                             world_up = self.tracker.R_wc @ np.array([0.0, 0.0, 1.0])
                             world_up = world_up / np.linalg.norm(world_up)
                             cos_a = float(np.clip(np.dot(marker_normal, world_up), -1, 1))
                             tilt_deg = float(np.degrees(np.arccos(abs(cos_a))))
 
-                            self._update_tracking(xyz_mm, tilt_deg)
-                            tracking = True
+                            # §8.1 Position processing
+                            x, y, z = float(xyz_mm[0]), float(xyz_mm[1]), float(xyz_mm[2])
 
-                            # Crosshair colour by control state
-                            if self.control_state == "TRACKING":
-                                color = (0, 255, 136)    # green
-                            elif self.control_state == "HOLDING":
-                                color = (0, 140, 255)    # orange
-                            elif self.control_state == "STANDBY":
-                                color = (180, 180, 180)  # grey
-                            else:  # WAITING
-                                color = (80, 80, 80)     # dark grey
+                            # Apply REF_OFFSET and axis mirror before calib capture/scale
+                            # so calibration operates in IK world frame (matches P6 ordering)
+                            x += REF_OFFSET_X_MM
+                            y += REF_OFFSET_Y_MM
+                            z += REF_OFFSET_Z_MM
+                            x  = -x   # ArUco X mirrored relative to IKSolver world frame
 
-                            corners = hand_corners
-                            cx = int(corners[:, 0].mean())
-                            cy = int(corners[:, 1].mean())
+                            raw_xyz = np.array([x, y, z])
+
+                            # Always store raw position — needed by _calib_capture()
+                            # regardless of calibration state (WAIT_P1, WAIT_P2, DONE)
+                            self._last_raw_xyz = raw_xyz.copy()
+
+                            # Feed calibration rolling buffer during capture phases
+                            # current_speed read here is from _run_control (main thread)
+                            # — safe read, GIL protects simple float reads
+                            if self._calib_state in ("WAIT_P1", "WAIT_P2"):
+                                if self.current_speed < self._hold_threshold:
+                                    self._calib_rolling.append(raw_xyz.copy())
+                                else:
+                                    self._calib_rolling.clear()
+
+                            # Apply calibration scale + offset and spline only when DONE
+                            if self._calib_state == "DONE":
+                                x = raw_xyz[0] * self._calib_scale[0] + self._calib_offset[0]
+                                y = raw_xyz[1] * self._calib_scale[1] + self._calib_offset[1]
+                                z = raw_xyz[2] * self._calib_scale[2] + self._calib_offset[2]
+
+                                # §8.1 Cubic spline — stays in camera thread
+                                t_now = time.time()
+                                self._traj_buf.append((t_now, np.array([x, y, z])))
+                                if (len(self._traj_buf) >= 4 and
+                                        self._traj_buf[-1][0] - self._traj_buf[0][0] >= TRAJ_MIN_SPAN):
+                                    _ts  = np.array([e[0] for e in self._traj_buf])
+                                    _pts = np.array([e[1] for e in self._traj_buf])
+                                    try:
+                                        _cs = CubicSpline(_ts, _pts)
+                                        _smooth = _cs(_ts[-1])
+                                        x, y, z = float(_smooth[0]), float(_smooth[1]), float(_smooth[2])
+                                    except Exception:
+                                        pass
+
+                            # Store results for display timer to consume
+                            self._latest_xyz          = np.array([x, y, z])
+                            self._latest_tilt         = tilt_deg
+                            self._latest_hand_visible = True
+                            self._hand_tracked        = True
+                            hand_visible              = True
+
+                            # Overlay — reads control_state (main thread writes, GIL safe)
+                            color = {"TRACKING": (0, 255, 136),
+                                     "HOLDING":  (0, 140, 255),
+                                     "STANDBY":  (180, 180, 180)}.get(
+                                        self.control_state, (80, 80, 80))
+                            cx = int(hand_corners[:, 0].mean())
+                            cy = int(hand_corners[:, 1].mean())
                             cv2.circle(display, (cx, cy), 18, color, 2)
                             cv2.drawMarker(display, (cx, cy), color,
                                            cv2.MARKER_CROSS, 20, 2)
-
                             cv2.putText(display, self.control_state,
                                         (cx - 30, cy - 24),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
                             if tilt_deg > 30.0:
                                 cv2.putText(display, f"TILT {tilt_deg:.0f}deg",
                                             (cx - 30, cy - 38),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 80, 255), 1)
-
-                            x, y, z = xyz_mm
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 80, 255), 2)
                             cv2.putText(display,
-                                        f"vis X:{x:+.0f} Y:{y:.0f} Z:{z:.0f}mm",
+                                        f"vis X:{xyz_mm[0]:+.0f} Y:{xyz_mm[1]:.0f} Z:{xyz_mm[2]:.0f}mm",
                                         (cx + 22, cy - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-                            ik_x = -(x + REF_OFFSET_X_MM)
-                            ik_y =   y + REF_OFFSET_Y_MM
-                            ik_z =   z + REF_OFFSET_Z_MM
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                            ik_x = x
+                            ik_y = y
+                            ik_z = z
                             cv2.putText(display,
                                         f"ik  X:{ik_x:+.0f} Y:{ik_y:.0f} Z:{ik_z:.0f}mm",
                                         (cx + 22, cy + 8),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-                    self._ids_present = list(poses.keys())   # read by _update_displays
+                    self._latest_ids_present = list(poses.keys())
 
-                    # §6.1 — "ready" means hand visible + world frame known.
-                    # Ref marker is only required if R_wc not yet established;
-                    # once calibrated, hand alone is sufficient (ref may be
-                    # occluded by the hand itself without breaking state).
-                    if self.tracker.R_wc is None:
-                        hand_ready = (REFERENCE_ID in poses
-                                      and HAND_ID in poses)
-                    else:
-                        hand_ready = (HAND_ID in poses)
-
-                    # §6.1 WAITING → STANDBY transition
-                    if self.control_state == "WAITING":
-                        if hand_ready:
-                            if self._both_visible_since is None:
-                                self._both_visible_since = time.time()
-                            elif time.time() - self._both_visible_since >= WAITING_VISIBLE_SECS:
-                                self.control_state       = "STANDBY"
-                                self._both_visible_since = None
-                                self._stable_since       = None
-                        else:
-                            self._both_visible_since = None
-
-                    # Update shared flag
-                    self._hand_tracked = tracking
-
-                    if not tracking:
-                        # Marker lost — change state but DO NOT clear everything.
-                        # The arm holds its last position. Keepalive fires from
-                        # _send_keepalive() below to prevent watchdog.
-                        # _clear_tracking() is only called on deliberate stop/rehome.
+                    if not hand_visible:
+                        # Marker lost — reset filters, signal to display timer
                         self.tracker.reset_filters()
-                        if self.control_state in ("TRACKING", "HOLDING", "STANDBY"):
-                            self.control_state = "WAITING"
-                            self._both_visible_since   = None
-                            self._stable_since         = None
-                            self._holding_stable_since = None
-                        # Send keepalive so watchdog doesn't fire while marker is lost
-                        self._send_keepalive(time.time())
-
+                        self._latest_hand_visible = False
+                        self._hand_tracked        = False
 
             else:
-                # Show calibration error
-                cv2.putText(display, "CALIB FILE MISSING", (20, 240),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+                cv2.putText(display, "CALIB FILE MISSING", (20, 480),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 0, 255), 3)
 
+            # Calibration overlay
             if self._calib_state in ("WAIT_P1", "WAIT_P2"):
                 pt_num = "1" if self._calib_state == "WAIT_P1" else "2"
-                cv2.rectangle(display, (0, 0), (640, 50), (0, 0, 0), -1)
+                cv2.rectangle(display, (0, 0), (1280, 100), (0, 0, 0), -1)
                 cv2.putText(display,
                             f"CALIBRATION P{pt_num} — move to extreme then press CAPTURE",
-                            (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
-                            (255, 200, 0), 2)
+                            (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 200, 0), 2)
                 if self._last_raw_xyz is not None:
                     px, py, pz = self._last_raw_xyz
-                    cv2.putText(display,
-                                f"X:{px:+.0f} Y:{py:.0f} Z:{pz:.0f} mm",
-                                (10, 43), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
-                                (200, 200, 200), 1)
+                    cv2.putText(display, f"X:{px:+.0f} Y:{py:.0f} Z:{pz:.0f} mm",
+                                (10, 86), cv2.FONT_HERSHEY_SIMPLEX, 0.84, (200, 200, 200), 2)
 
-
-            # Overlay: enabled/disabled + gripper value
+            # Status overlays
             label = "CONTROL: ENABLED" if self.enabled else "CONTROL: PAUSED"
             col   = (0, 255, 136) if self.enabled else (80, 80, 80)
-            cv2.putText(display, label, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+            cv2.putText(display, label, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.2, col, 2)
             if self._pinch.hand_seen:
-                cv2.putText(display,
-                            f"GRIPPER: {self._pinch.gripper_pwm}µs",
-                            (10, 58), cv2.FONT_HERSHEY_SIMPLEX,
-                            0.5, (255, 170, 68), 1)
+                cv2.putText(display, f"GRIPPER: {self._pinch.gripper_pwm}µs",
+                            (10, 116), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 170, 68), 2)
 
-            # Bottom banner — shows any active suppression reason
+            # Bottom banner
             if self.speed_status == "TOO_FAST":
-                cv2.rectangle(display, (0, 440), (640, 480), (0, 0, 180), -1)
+                cv2.rectangle(display, (0, 880), (1280, 960), (0, 0, 180), -1)
                 cv2.putText(display, f"!!! TOO FAST {self.current_speed:.0f}mm/s — SLOW DOWN !!!",
-                            (20, 468), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                            (255, 255, 255), 2)
+                            (20, 908), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (255, 255, 255), 2)
             elif self.speed_status == "WARNING":
-                cv2.rectangle(display, (0, 440), (640, 480), (0, 80, 160), -1)
+                cv2.rectangle(display, (0, 880), (1280, 960), (0, 80, 160), -1)
                 cv2.putText(display, f"Moving fast — {self.current_speed:.0f}mm/s",
-                            (20, 468), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                            (255, 255, 255), 2)
+                            (20, 908), cv2.FONT_HERSHEY_SIMPLEX, 1.3, (255, 255, 255), 2)
             elif self.suppress_reason:
-                cv2.rectangle(display, (0, 440), (640, 480), (0, 0, 100), -1)
+                cv2.rectangle(display, (0, 880), (1280, 960), (0, 0, 100), -1)
                 txt = self.suppress_reason[:60]
                 cv2.putText(display, f"SUPPRESSED: {txt}",
-                            (10, 468), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                            (200, 120, 120), 1)
+                            (10, 908), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (200, 120, 120), 2)
 
-            # Resize for display only — full FOV, smaller render
+            # Store raw PIL image — display timer resizes to fit panel width
             rgb   = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
-            rgb   = cv2.resize(rgb, (480, 360), interpolation=cv2.INTER_LINEAR)
-            img   = Image.fromarray(rgb)
-            imgtk = ImageTk.PhotoImage(image=img)
-            self.root.after(0, self._update_cam_label, imgtk)
+            self._latest_frame = Image.fromarray(rgb)
 
-            # §7.3 — deadline-based pacing: sleep only the remaining time in
-            # the frame budget so detection cost doesn't accumulate as drift.
+            # §7.3 deadline pacing
             _frame_end = time.perf_counter()
-            _elapsed   = _frame_end - _frame_start
-            _remaining = (1.0 / 30) - _elapsed
+            _remaining = (1.0 / 30) - (_frame_end - _frame_start)
             if _remaining > 0:
                 time.sleep(_remaining)
 
-    def _update_cam_label(self, imgtk):
-        self.cam_label.imgtk = imgtk   # keep reference
+
+    def _update_cam_label(self, pil_img):
+        """Resize frame to fit panel width (4:3 maintained) and display.
+        Called from display timer on main thread — safe to access _cam_panel_w.
+        Panel width tracked via <Configure> binding on camera frame.
+        """
+        panel_w = getattr(self, '_cam_panel_w', 960)
+        if panel_w < 10:
+            panel_w = 960
+        # Maintain 4:3 aspect ratio (1280×960 source)
+        panel_h = panel_w * 3 // 4
+        resized  = pil_img.resize((panel_w, panel_h), Image.LANCZOS)
+        imgtk    = ImageTk.PhotoImage(image=resized)
+        self.cam_label.imgtk = imgtk   # keep reference — prevents GC
         self.cam_label.configure(image=imgtk)
 
-    # ═══════════════════════════════════════════════════════
-    # TRACKING + CONTROL
-    # ═══════════════════════════════════════════════════════
-
-    def _update_tracking(self, xyz_mm: np.ndarray, marker_tilt_deg: float = 0.0):
+    def _run_control(self, xyz_mm: np.ndarray, marker_tilt_deg: float, t: float):
+        """Phase 9: runs on main thread at 30Hz when hand is visible.
+        Handles IK solve, state machine, safety gates, and serial send.
+        Handles state machine, IK solve, safety gates, serial send.
+        xyz_mm is already calibration-scaled and spline-smoothed by camera thread.
         """
-        Called every camera frame with filtered hand position in world mm.
-        Runs state machine (§6.1–6.2), tilt validity check (§6.4),
-        IK solve, safety gates, and sends command if clear.
-        """
-        t = time.time()   # single timestamp for entire frame — spline + rate gate both use this
+        # xyz_mm is calibration-scaled, spline-smoothed, REF_OFFSET-translated
+        # and axis-mirrored by camera thread. Ready for IK solve directly.
         x, y, z = float(xyz_mm[0]), float(xyz_mm[1]), float(xyz_mm[2])
 
-        # ── Translate from vision frame → IK world frame ──────────
-        x += REF_OFFSET_X_MM
-        y += REF_OFFSET_Y_MM
-        z += REF_OFFSET_Z_MM
-        x  = -x   # ArUco X is mirrored relative to IKSolver world frame
-
-        # ── Apply hand calibration affine remap ───────────────────
-        # Maps raw hand range [P1, P2] → workspace [WS_MIN, WS_MAX]
-        # offset = WS_MIN - P1*scale, so: out = raw*scale + offset
-        raw_xyz = np.array([x, y, z])
+        raw_xyz  = np.array([x, y, z])
         _in_deadband = (
             self._last_sent_raw_xyz is not None and
             np.linalg.norm(raw_xyz - self._last_sent_raw_xyz) < DEADBAND_MM
         )
-
-        x = x * self._calib_scale[0] + self._calib_offset[0]
-        y = y * self._calib_scale[1] + self._calib_offset[1]
-        z = z * self._calib_scale[2] + self._calib_offset[2]
-
-        self._last_raw_xyz = np.array([x, y, z])
-
-        # ── §8.1 Cubic spline trajectory smoother ─────────────────────────────────
-        # Always buffer positions at full frame rate for a dense sample set.
-        # Only fit and evaluate the spline at 10Hz (command rate) to avoid
-        # running a scipy matrix solve 30x/second in the camera thread.
-        self._traj_buf.append((t, np.array([x, y, z])))
-        _rate_due = (t - self.last_send_t >= 1.0 / UPDATE_RATE_HZ)
-        if (_rate_due and len(self._traj_buf) >= 4 and
-                self._traj_buf[-1][0] - self._traj_buf[0][0] >= TRAJ_MIN_SPAN):
-            _ts  = np.array([e[0] for e in self._traj_buf])
-            _pts = np.array([e[1] for e in self._traj_buf])  # (N, 3)
-            try:
-                _cs = CubicSpline(_ts, _pts)
-                _smooth = _cs(_ts[-1])   # evaluate at latest time
-                x, y, z = float(_smooth[0]), float(_smooth[1]), float(_smooth[2])
-            except Exception:
-                pass  # fall back to raw if spline fails (degenerate buffer)
 
         # ── 3D velocity ───────────────────────────────────────────
         self._pos_hist.append((t, xyz_mm.copy()))
         if len(self._pos_hist) >= 2:
             t0, p0 = self._pos_hist[0]
             dt = t - t0
-            self.current_speed = float(np.linalg.norm(xyz_mm - p0)) / dt \
-                                  if dt > 0.001 else 0.0
+            self.current_speed = float(np.linalg.norm(xyz_mm - p0)) / dt                                   if dt > 0.001 else 0.0
         else:
             self.current_speed = 0.0
 
-        # Feed rolling buffer with PRE-scale, STILL-hand frames only.
-        # Gated on speed < hold_threshold so transit frames never contaminate
-        # the mean — prevents the bias that causes calibration drift.
-        if self._calib_state in ("WAIT_P1", "WAIT_P2"):
-            if self.current_speed < self._hold_threshold:
-                self._calib_rolling.append(raw_xyz.copy())
+        # ── §6.1 WAITING → STANDBY ────────────────────────────────
+        if self.tracker.R_wc is None:
+            hand_ready = (REFERENCE_ID in self._latest_ids_present
+                          and HAND_ID in self._latest_ids_present)
+        else:
+            hand_ready = True   # hand is visible (we're in _run_control)
+
+        if self.control_state == "WAITING":
+            if hand_ready:
+                if self._both_visible_since is None:
+                    self._both_visible_since = t
+                elif t - self._both_visible_since >= WAITING_VISIBLE_SECS:
+                    self.control_state       = "STANDBY"
+                    self._both_visible_since = None
+                    self._stable_since       = None
             else:
-                self._calib_rolling.clear()   # hand moved — discard stale frames
+                self._both_visible_since = None
 
         # ── §6.1–6.2 State machine ────────────────────────────────
         hand_still = self.current_speed < self._hold_threshold
 
-        if self.control_state == "WAITING":
-            # WAITING→STANDBY is handled in camera loop (both-visible timer)
-            # If we reach here still WAITING, suppress all commands
-            pass
-
-        elif self.control_state == "STANDBY":
+        if self.control_state == "STANDBY":
             if hand_still:
                 if self._stable_since is None:
                     self._stable_since = t
@@ -2208,8 +2256,10 @@ class VisionGUI:
                     self.control_state = "TRACKING"
                     self._stable_since = None
                     self._holding_stable_since = None
+                    self.last_steps = None          # clear jerk ref for catch-up
+                    self._last_sent_raw_xyz = None  # clear deadband ref
             else:
-                self._stable_since = None   # reset countdown if hand moves
+                self._stable_since = None
 
         elif self.control_state == "TRACKING":
             if not hand_still:
@@ -2223,10 +2273,12 @@ class VisionGUI:
                 elif t - self._holding_stable_since >= self._retrack_secs:
                     self.control_state = "TRACKING"
                     self._holding_stable_since = None
+                    self.last_steps = None          # clear jerk ref for catch-up
+                    self._last_sent_raw_xyz = None
             else:
                 self._holding_stable_since = None
 
-        # Speed display status (independent of state machine — for overlay)
+        # Speed status
         if   self.current_speed > MAX_SPEED_3D:  self.speed_status = "TOO_FAST"
         elif self.current_speed > WARNING_SPEED:  self.speed_status = "WARNING"
         else:                                     self.speed_status = "OK"
@@ -2238,56 +2290,45 @@ class VisionGUI:
 
         # ── IK solve ──────────────────────────────────────────────
         result = solve(x, y, z)
-        self.last_result  = result
-        self.current_pos  = (x, y, z)
+        self.last_result = result
+        self.current_pos = (x, y, z)
 
-        # ── Safety gate — collect all suppress reasons ────────────
+        # ── Safety gate ───────────────────────────────────────────
         reasons = []
-
-        # 0. Manual mode — jog panel has control; suppress vision sends
         if self._manual_mode:
             reasons.append("MANUAL MODE")
-
-        # 1. State machine — only TRACKING state sends commands
         if self.control_state != "TRACKING":
             reasons.append(self.control_state)
-
-        # 2. §6.4 Tilt validity — reject if marker tilted > 30° from horizontal
         if marker_tilt_deg > 30.0:
             reasons.append(f"TILT {marker_tilt_deg:.0f}°")
-
-        # 3. IK reachability
         if not result.reachable:
             reasons.append("IK:" + "; ".join(result.warnings))
-
-        # 4. Jerk limit
         if self.last_steps is not None:
             new_steps = (result.base_steps, result.shoulder_steps,
                          result.elbow_steps, result.wrist_steps)
-            names = ("B", "S", "E", "W")
-            for nm, prev, cur in zip(names, self.last_steps, new_steps):
-                delta = abs(cur - prev)
-                if delta > MAX_STEP_JUMP:
-                    reasons.append(f"JERK {nm}:{delta}steps")
+            for nm, prev, cur in zip(("B","S","E","W"), self.last_steps, new_steps):
+                if abs(cur - prev) > MAX_STEP_JUMP:
+                    reasons.append(f"JERK {nm}:{abs(cur-prev)}steps")
 
         self.suppress_reason = " | ".join(reasons)
 
-        # ── Send if clear ─────────────────────────────────────────
-        rate_ok = (t - self.last_send_t >= 1.0 / UPDATE_RATE_HZ)   # reuse t from top of frame
-
-        if self.enabled and self.connected and not reasons and rate_ok:
+        # ── Send ──────────────────────────────────────────────────
+        if self.enabled and self.connected and not reasons:
             g = self._pinch.gripper_pwm
-
-            # Gripper deadband — independent of position deadband
             g_changed = (self._last_sent_g is None or
                          abs(g - self._last_sent_g) >= DEADBAND_GRIPPER_US)
             if not g_changed:
-                g = self._last_sent_g  # hold last value
+                g = self._last_sent_g
 
-            # Speed matching — map hand velocity to V: percentage
-            if SPEED_MATCH_ENABLED:
-                # Map hand speed [0, HAND_MAX_SPEED_MMS] → V [SPEED_MATCH_MIN, SPEED_MATCH_MAX]
-                # Clamp at top so speeds above HAND_MAX_SPEED_MMS still get full V
+            # Catch-up detection — override speed match with V:CATCHUP_SPEED
+            _catching_up = (self.last_steps is not None and (
+                abs(result.base_steps     - self.last_steps[0]) > MAX_STEP_JUMP or
+                abs(result.shoulder_steps - self.last_steps[1]) > MAX_STEP_JUMP or
+                abs(result.elbow_steps    - self.last_steps[2]) > MAX_STEP_JUMP or
+                abs(result.wrist_steps    - self.last_steps[3]) > MAX_STEP_JUMP))
+            if _catching_up:
+                v = CATCHUP_SPEED
+            elif SPEED_MATCH_ENABLED:
                 ratio = self.current_speed / HAND_MAX_SPEED_MMS
                 if ratio > 1.0: ratio = 1.0
                 v = int(SPEED_MATCH_MIN + ratio * (SPEED_MATCH_MAX - SPEED_MATCH_MIN))
@@ -2296,29 +2337,32 @@ class VisionGUI:
             else:
                 v = 100
 
-            # Send if position moved OR gripper changed (or both)
             if not _in_deadband or g_changed:
                 b = result.base_steps
                 s = result.shoulder_steps
                 e = result.elbow_steps
                 w = result.wrist_steps
-
                 cmd = f"B:{b} S:{s} E:{e} W:{w} G:{g} V:{v}"
                 if self.serial.send(cmd):
-                    self.command_count      += 1
-                    self.last_send_t         = t
-                    self._last_sent_g        = g
-
+                    self.command_count     += 1
+                    self.last_send_t        = t
+                    self._last_sent_g       = g
                     if not _in_deadband:
-                        self.last_steps          = (b, s, e, w)
-                        self._last_sent_raw_xyz  = raw_xyz.copy()
-                    self._last_cmd_str  = cmd   # display timer reads this at 10Hz
-                    self.root.after(0, self._monitor_line, f"→ {cmd}", "tx")   # log to monitor only
+                        self.last_steps         = (b, s, e, w)
+                        self._last_sent_raw_xyz = raw_xyz.copy()
+                    self._last_cmd_str = cmd
 
-        # Keepalive — keep watchdog alive when commands suppressed for any reason
-        self._send_keepalive(t)
-
-        # display updates are driven by the 10Hz recurring timer, not per-frame
+    def _on_hand_lost(self, t: float):
+        """Phase 9: called from display timer when hand marker not visible.
+        Updates state machine — arm holds position, keepalive prevents watchdog.
+        """
+        if self.control_state in ("TRACKING", "HOLDING", "STANDBY"):
+            self.control_state = "WAITING"
+            self._both_visible_since   = None
+            self._stable_since         = None
+            self._holding_stable_since = None
+        self.current_speed = 0.0
+        self.speed_status  = "NO_TRACKING"
 
     def _send_keepalive(self, t):
         """Send last known position to keep firmware watchdog alive.
@@ -2333,15 +2377,18 @@ class VisionGUI:
         - sent too recently (400ms interval, well within 500ms watchdog)
         """
         KEEPALIVE_INTERVAL = 0.4
+        # Timeout fallback: if DONE: never arrived, release after _preset_move_until
+        if not self._preset_move_is_done and t >= self._preset_move_until:
+            self._preset_move_is_done = True
         if (self.connected and
                 self.last_steps is not None and
                 t - self.last_send_t >= KEEPALIVE_INTERVAL and
-                t >= self._preset_move_until):
+                self._preset_move_is_done):
             # self.enabled deliberately NOT required — keepalive must fire even
             # when vision is paused or disabled, as long as the serial connection
             # is live and the firmware watchdog is armed.
-            # _preset_move_until blocks keepalive during manual preset moves so
-            # the firmware ramp is not interrupted and restarted every 400ms.
+            # _preset_move_is_done blocks keepalive during P:1 preset ramp to
+            # prevent ramp restart. Released by DONE: or _preset_move_until fallback.
             b, s, e, w = self.last_steps
             g_ka = self._last_sent_g if self._last_sent_g is not None else self._pinch.gripper_pwm
             cmd = f"B:{b} S:{s} E:{e} W:{w} G:{g_ka} V:100"
@@ -2371,9 +2418,12 @@ class VisionGUI:
             self._log("No hand detected — move hand into view first.", "warn")
             return
 
-        # Use rolling buffer if populated, fall back to single frame
-        if len(self._calib_rolling) >= 3:
-            buf      = np.array(self._calib_rolling)
+        # Use rolling buffer if populated, fall back to single frame.
+        # Take a snapshot copy first — camera thread appends at 30fps concurrently.
+        # list() copy is atomic under the GIL; np.array() on the snapshot is safe.
+        buf_snapshot = list(self._calib_rolling)
+        if len(buf_snapshot) >= 3:
+            buf      = np.array(buf_snapshot)
             captured = np.mean(buf, axis=0)
             spread   = float(np.max(np.max(buf, axis=0) - np.min(buf, axis=0)))
             n        = len(buf)
@@ -2701,7 +2751,12 @@ class VisionGUI:
             self.connected = False
             self.btn_connect.configure(text="CONNECT", bg="#001a08")
             self._set_status("● DISCONNECTED", FG_ERR)
+            self._hide_home_prompt()
             self._log("Disconnected.", "info")
+            self._expecting_boot = False   # clear in case disconnect before boot received
+            # Reset all control state — stale last_steps from previous session
+            # would cause jitter on reconnect (catch-up to wrong position)
+            self._reset_control_state()
         else:
             port = self.port_var.get()
             if not port:
@@ -2709,48 +2764,94 @@ class VisionGUI:
                 return
             result = self.serial.connect(port)
             if result is True:
-                self.connected = True
+                self.connected       = True
+                self._expecting_boot = True   # flag in case BOOT: arrives after connect
                 self.btn_connect.configure(text="DISCONNECT", bg="#003300")
                 self._set_status(f"● CONNECTED  {port}  {BAUD_RATE}", FG)
-                self._log(f"Connected to {port}. Waiting for boot...", "ok")
-                # Auto-home after boot delay
-                threading.Thread(target=self._auto_home, daemon=True).start()
+                self._log(f"Connected to {port}.", "ok")
+                self._log("If arm is un-homed press HOME ALL. If already homed, enable vision.", "info")
             else:
                 self._log(f"Connection failed: {result}", "err")
 
-    def _auto_home(self):
-        time.sleep(3)
-        self.root.after(0, self._log, "Sending safety prompt 'y'...", "info")
-        self.serial.send("y")
-        self.root.after(0, self._log,
-                        "Homing all motors — please wait (~35s)...", "info")
-        self.root.after(0, self._set_status,
-                        "● HOMING — please wait...", FG_WARN)
-        self.homing = True
-        # Event-driven wait: _handle_rx sets self.homing=False when it sees
-        # ALL MOTORS HOMED. Poll rather than sleep a fixed 35 seconds.
-        timeout = 120   # generous ceiling for slow homing or stall retry
-        waited  = 0
-        while self.homing and waited < timeout:
-            time.sleep(0.5)
-            waited += 0.5
-        if not self.homing:
-            self.root.after(0, self._log, "Homing complete — ready.", "ok")
-            self.root.after(0, self._set_status,
-                            f"● CONNECTED  {self.port_var.get()}  {BAUD_RATE}", FG)
+    def _reset_control_state(self):
+        """Reset all vision control state — called on disconnect and after homing.
+        Clears stale last_steps so reconnect/rehome doesn't cause jitter from
+        catch-up detection comparing new positions against old session steps.
+        """
+        self.last_steps             = None
+        self.last_send_t            = 0.0
+        self._last_sent_raw_xyz     = None
+        self._last_sent_g           = None
+        self._preset_move_is_done   = True
+        self._preset_move_until     = 0.0
+        self.control_state          = "WAITING"
+        self.enabled                = False
+        self.enable_btn.configure(text="▶  ENABLE CONTROL", bg="#002200")
+        self.current_pos            = None
+        self.current_speed          = 0.0
+        self.speed_status           = "NO_TRACKING"
+        self.last_result            = None
+        self._both_visible_since    = None
+        self._stable_since          = None
+        self._holding_stable_since  = None
+        self._pos_hist.clear()
+        self._traj_buf.clear()
+
+    def _show_home_prompt(self, boot_delay=False, warning=False):
+        """Show YES/NO home prompt in status bar.
+        boot_delay=True: YES button disabled for 3s (DTR reset settle time).
+        warning=True: shows re-home warning message (mid-session BOOT: reset).
+        """
+        if warning:
+            self._set_status("⚠ ESP32 RESET — Re-home required?", FG_ERR)
         else:
-            self.root.after(0, self._log,
-                            "Homing timeout — check arm and retry.", "warn")
-            self.root.after(0, self._set_status,
-                            "● HOMING TIMEOUT", FG_ERR)
+            self._set_status("● CONNECTED — Home all motors?", FG_WARN)
+
+        # Show buttons
+        self._home_yes_btn.pack(side="right", padx=(0, 4))
+        self._home_no_btn.pack(side="right", padx=(0, 4))
+
+        if boot_delay:
+            # Disable YES for 3s — ESP32 needs time to finish booting after DTR reset
+            self._home_yes_btn.configure(state="disabled", bg="#1a2e1a", fg="#336633")
+            self.root.after(1000, self._enable_home_yes)   # 1s margin — DTR suppressed but brief delay still safe
+        else:
+            self._enable_home_yes()
+
+    def _enable_home_yes(self):
+        """Enable YES button after boot delay."""
+        self._home_yes_btn.configure(state="normal", bg="#003300", fg="#00ff88")
+
+    def _hide_home_prompt(self):
+        """Hide YES/NO buttons from status bar."""
+        self._home_yes_btn.pack_forget()
+        self._home_no_btn.pack_forget()
+
+    def _home_confirm_yes(self):
+        """User confirmed — send y to firmware, start homing."""
+        self._hide_home_prompt()
+        self._set_status("● HOMING — please wait...", FG_WARN)
+        self._log("Sending 'y' — homing all motors...", "info")
+        self.serial.send("y")
+
+    def _home_confirm_no(self):
+        """User declined — arm stays un-homed, IK commands blocked."""
+        self._hide_home_prompt()
+        self._set_status("● UN-HOMED — send 'a' to home manually", FG_WARN)
+        self._log("Homing skipped — arm un-homed. Use HOME ALL button when ready.", "warn")
 
     def _home_all(self):
         if not self.connected:
             self._log("Not connected.", "err")
             return
+        # Clear last_steps immediately — stops keepalive from queuing commands
+        # during the ~35s blocking homing sequence. Queued commands would arrive
+        # after homing completes and drive arm to old position.
+        self._reset_control_state()
         self.serial.send("a")
+        self._set_status("● HOMING — please wait...", FG_WARN)
         self._monitor_line("→ a  (HOME ALL)", "tx")
-        self._log("→ HOME ALL sent", "tx")
+        self._log("→ HOME ALL sent — homing all motors...", "info")
 
     def _toggle_speed_match(self):
         global SPEED_MATCH_ENABLED
@@ -2779,12 +2880,6 @@ class VisionGUI:
             self._last_sent_g       = None
             # last_steps intentionally preserved for keepalive and jerk gate on resume
 
-    def _send_raw_entry(self):
-        msg = self.raw_var.get().strip()
-        if msg and self.connected:
-            self.serial.send(msg)
-            self._monitor_line(f"→ {msg}", "tx")
-            self.raw_var.set("")
 
     def on_rx(self, line):
         self.root.after(0, self._handle_rx, line)
@@ -2794,18 +2889,41 @@ class VisionGUI:
         # Firmware restarted mid-session — arm is un-homed. Pause control
         # and trigger a fresh home sequence.
         if line.startswith("BOOT:"):
+            self._monitor_line(f"← {line}", "rx_err")
+            if self._expecting_boot:
+                # BOOT: arrived shortly after connect — chip reset for some reason
+                # (e.g. power glitch, manual reset). Show home prompt.
+                self._expecting_boot = False
+                self._log("ESP32 boot detected after connect — showing home prompt.", "info")
+                self._reset_control_state()
+                self._show_home_prompt(boot_delay=True, warning=False)
+                return
+            # Mid-session reset — arm is un-homed
             self.enabled = False
             self.enable_btn.configure(text="▶  ENABLE CONTROL", bg="#002200")
-            self._log("⚠ ESP32 RESET detected — arm un-homed. Re-homing...", "err")
-            self._set_status("● ESP32 RESET — re-homing...", FG_ERR)
-            threading.Thread(target=self._auto_home, daemon=True).start()
-            self._monitor_line(f"← {line}", "rx_err")
+            self._log("⚠ ESP32 RESET detected mid-session — arm un-homed.", "err")
+            self._reset_control_state()
+            self._show_home_prompt(boot_delay=False, warning=True)
+            return
+
+        # ── HOMING progress updates ────────────────────────────────────
+        if line.startswith(">>> HOMING"):
+            motor = line.replace(">>> HOMING", "").replace("...", "").strip()
+            self._set_status(f"● HOMING {motor}...", FG_WARN)
+            self._monitor_line(f"← {line}", "rx_info")
             return
 
         # ── ALL MOTORS HOMED ────────────────────────────────────────────
-        # Firmware homing complete — release the _auto_home wait loop.
+        if "ALL MOTORS HOMED" in line or ("ALL MOTORS" in line and "HOMED" in line):
+            self._hide_home_prompt()
+            self._reset_control_state()   # arm at IK zero — clear stale steps
+            self._set_status(f"● READY — IK zero set  {self.port_var.get()}", FG)
+            self._log("✔ All motors homed — ready.", "ok")
+            self._monitor_line(f"← {line}", "rx_ok")
+            return
+        # Individual motor homed — update status
         if "HOMED" in line:
-            self.homing = False
+            self._set_status(f"● HOMING...  {line.strip()}", FG_WARN)
             self._monitor_line(f"← {line}", "rx_ok")
             return
 
@@ -2830,6 +2948,14 @@ class VisionGUI:
             else:
                 self._log("Watchdog timeout (manual mode — arm idle, normal).", "info")
             self._monitor_line(f"← {line}", "rx_warn")
+            return
+
+        # ── DONE: preset move complete ──────────────────────────────────
+        if line.startswith("DONE:"):
+            self._preset_move_is_done = True
+            self._send_keepalive(time.time())
+            self._log(f"Preset complete — {line.strip()}", "ok")
+            self._monitor_line(f"← {line}", "rx_ok")
             return
 
         # ── Standard tag routing ────────────────────────────────────────

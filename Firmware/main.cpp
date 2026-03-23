@@ -152,8 +152,8 @@
 #define SHOULDER_MAX_DEG     98.0f
 #define ELBOW_MIN_DEG      -115.0f
 #define ELBOW_MAX_DEG         0.0f
-#define WRIST_MIN_DEG      -200.0f
-#define WRIST_MAX_DEG       200.0f
+#define WRIST_MIN_DEG      -149.0f
+#define WRIST_MAX_DEG       26.0f
 
 // Step limits derived from degree limits
 #define BASE_STEPS_MIN      ((long)(BASE_MIN_DEG     * BASE_STEPS_PER_DEG))
@@ -438,6 +438,8 @@ unsigned long lastCommandMs    = 0;
 unsigned long stateBroadcastMs = 0;
 bool          watchdogFired    = false;   // true after first timeout — suppresses repeat broadcasts
 bool          watchdogArmed    = false;   // armed only after first valid IK command (spec 8.5)
+bool          presetInProgress = false;   // true after P:1 command — waiting for allStopped() to broadcast DONE:
+bool          wasMoving        = false;   // tracks allStopped() transition for DONE: detection
 #define STATE_BROADCAST_MS  500
 
 void homeMotor(int motor) {
@@ -599,6 +601,11 @@ void homeAll() {
 // ═══════════════════════════════════════════════════════════════
 
 bool startupSafetyPrompt() {
+  // Flush any garbage on RX line before showing prompt
+  // (noise from floating RX before Python connects could trigger false 'y')
+  delay(100);
+  while (Serial.available()) Serial.read();
+
   Serial.println("\n╔══════════════════════════════════════════════════════╗");
   Serial.println("║              STARTUP SAFETY CHECK                   ║");
   Serial.println("╠══════════════════════════════════════════════════════╣");
@@ -674,6 +681,12 @@ void handleIKCommand(const String& line) {
     if (vPct > 100) vPct = 100;
   }
 
+  // P: preset flag (optional, default 0)
+  // P:1 = one-shot preset move — use trapezoidal ramp, broadcast DONE: on completion
+  // P:0 or absent = streaming — accel=0, no ramp (ramp resets every 100ms at 10Hz)
+  int pIdx   = line.indexOf("P:");
+  bool isPreset = (pIdx >= 0 && line.substring(pIdx + 2).toInt() == 1);
+
   if (!allHomed()) {
     Serial.println("ERR: NOT_HOMED");
     return;
@@ -708,7 +721,11 @@ void handleIKCommand(const String& line) {
   // startDelay remains available for future use via setTarget directly.
   //   STREAM_THRESH = 151 (one above the GUI jerk limit of 150 steps/axis)
 
-  const long STREAM_THRESH = 151;
+  // — Coordinated pacer: mTicks per motor derived from slowest motor duration —
+  // Streaming (P:0): accel=0 always — ramp resets every 100ms at 10Hz so motor
+  //   never leaves ramp-start speed. Pacer (mTicks) provides speed control.
+  // Preset (P:1): full proportional ramp — one-shot move, no follow-up commands
+  //   to reset stepsDone. DONE: broadcast when allStopped() after preset.
 
   const int motorCaps[NUM_MOTORS] = {
     BASE_MAX_SPEED_TICKS,
@@ -720,10 +737,9 @@ void handleIKCommand(const String& line) {
   long targets[NUM_MOTORS] = {b, s, e, w};
   long deltas[NUM_MOTORS];
   long pacerDuration = 1;
-  long pacerSteps    = 1;
-  bool isStreaming   = true;
+  long pacerSteps    = 1;   // only used for preset ramp scaling
 
-  // Snapshot current positions atomically — volatile long reads are not atomic on dual-core ESP32
+  // Snapshot current positions atomically
   long curSteps[NUM_MOTORS];
   portENTER_CRITICAL(&timerMux);
   for (int i = 0; i < NUM_MOTORS; i++) curSteps[i] = motors[i].currentSteps;
@@ -731,7 +747,6 @@ void handleIKCommand(const String& line) {
 
   for (int i = 0; i < NUM_MOTORS; i++) {
     deltas[i] = abs(targets[i] - curSteps[i]);
-    if (deltas[i] >= STREAM_THRESH) isStreaming = false;
     long duration = deltas[i] * (long)motorCaps[i];
     if (duration > pacerDuration) {
       pacerDuration = duration;
@@ -748,15 +763,23 @@ void handleIKCommand(const String& line) {
       mAccel = 0;
     } else {
       mTicks = (int)((pacerDuration + deltas[i] - 1) / deltas[i]);
-      if (mTicks > MIN_SPEED_TICKS) mTicks = MIN_SPEED_TICKS;
-      if (isStreaming) {
-        mAccel = 0;                                                    // no ramp for streaming
-      } else {
-        mAccel = (int)((long)ACCEL_STEPS * deltas[i] / pacerSteps);   // proportional ramp for presets
+      // Preset (P:1): no cap — pacer unconstrained so all motors finish together.
+      // Streaming (P:0): cap at MIN_SPEED_TICKS — prevents stall at very slow speeds.
+      if (!isPreset && mTicks > MIN_SPEED_TICKS) mTicks = MIN_SPEED_TICKS;
+      if (isPreset) {
+        mAccel = (int)((long)ACCEL_STEPS * deltas[i] / pacerSteps);
         if (mAccel < 1) mAccel = 1;
+      } else {
+        mAccel = 0;   // streaming — no ramp
       }
     }
-    setTarget(i, targets[i], mTicks, mAccel, 0);  // delay always 0 for IK commands
+    setTarget(i, targets[i], mTicks, mAccel, 0);
+  }
+
+  // Mark preset in progress so loop() broadcasts DONE: when arm stops
+  if (isPreset) {
+    presetInProgress = true;
+    wasMoving        = false;   // reset so transition is detected cleanly
   }
 
   lastCommandMs  = millis();
@@ -958,6 +981,31 @@ void loop() {
     w = motors[MOTOR_WRIST].currentSteps;
     portEXIT_CRITICAL(&timerMux);
     Serial.printf("STATE: B:%ld S:%ld E:%ld W:%ld\n", b, s, e, w);
+  }
+
+  // DONE: broadcast — fires once when a P:1 preset move completes.
+  // Detects allStopped() transition (wasMoving → stopped) so Python knows
+  // to fire keepalive immediately and prevent watchdog timeout.
+  if (presetInProgress && allHomed()) {
+    bool stopped = allStopped();
+    if (!stopped) {
+      wasMoving = true;   // arm is moving — latch so we detect the transition
+    } else if (wasMoving && stopped) {
+      // Transition: was moving, now stopped — preset complete
+      long b, s, e, w;
+      portENTER_CRITICAL(&timerMux);
+      b = motors[MOTOR_BASE].currentSteps;
+      s = motors[MOTOR_SHOULDER].currentSteps;
+      e = motors[MOTOR_ELBOW].currentSteps;
+      w = motors[MOTOR_WRIST].currentSteps;
+      portEXIT_CRITICAL(&timerMux);
+      Serial.printf("DONE: B:%ld S:%ld E:%ld W:%ld\n", b, s, e, w);
+      lastCommandMs    = millis();   // reset watchdog clock
+      watchdogArmed    = false;      // disarm — arm is idle deliberately after preset
+                                     // re-arms on next IK command (keepalive or vision)
+      presetInProgress = false;
+      wasMoving        = false;
+    }
   }
 
   // Watchdog: arms after first valid IK command (spec 8.5).

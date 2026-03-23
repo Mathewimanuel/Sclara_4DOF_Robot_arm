@@ -32,20 +32,21 @@ from typing import Tuple
 
 # ── Physical dimensions (mm) ──────────────────────────────────────────────────
 L1                   = 160.0   # shoulder pivot → elbow pivot
-L2                   = 135.0   # elbow pivot → wrist pivot (straight line)
-L2_AXIS              = math.sqrt(L2**2 - 20**2)  # 133.5mm along forearm axis
-L2_PERP              = 20.0    # wrist pivot sits 20mm above elbow pivot in forearm frame
-TOOL_MM              = 122.0   # wrist pivot → tool tip (confirmed physical measurement)
+L2                       = 138.0   # elbow pivot → wrist pivot straight-line (measured)
+L2_PERP                  = 13.0    # wrist pivot perpendicular offset above forearm axis (measured)
+L2_AXIS              = math.sqrt(L2**2 - L2_PERP**2)   # derived from measured L2 and L2_PERP
+TOOL_MM                  = 118.6   # wrist pivot → tool tip horizontal (measured)
+TOOL_Z_OFFSET_MM      = -7.3    # wrist pivot → tool tip vertical offset (tool tip sits below pivot)
 FOREARM_EXTENSION_MM = 25.0    # wrist pivot to mounting plate
 TOOL_FROM_PLATE_MM   = 50.0    # mounting plate to tool tip
 
-SHOULDER_Z_OFFSET_MM = 150.0   # table surface → shoulder pivot
+SHOULDER_Z_OFFSET_MM     = 146.0   # table surface → shoulder pivot height (measured)
 BASE_MOUNT_HEIGHT_MM  = 95.0   # table surface → top of mount cylinder
-SHOULDER_DH_OFFSET_MM = 44.0   # shoulder pivot distance in front of base rotation axis
+SHOULDER_DH_OFFSET_MM    = 38.0   # base rotation axis → shoulder pivot horizontal offset (measured)
 
 # ── DH offset angle (constant, computed once) ─────────────────────────────────
 # Wrist pivot is 20mm above elbow in forearm frame → effective L2 rotated by BETA
-BETA = math.atan2(L2_PERP, L2_AXIS)   # ≈ 8.53°
+BETA = math.atan2(L2_PERP, L2_AXIS)   # ≈ 5.41° (derived from L2=138, L2_PERP=13)
 
 # ── Wrist structure ───────────────────────────────────────────────────────────
 WRIST_HALF_HEIGHT_MM = 17.5    # half of 35mm body → bottom hits table at pivot Z < 17.5mm
@@ -72,12 +73,12 @@ SHOULDER_MIN_DEG  =    0.0
 SHOULDER_MAX_DEG  =   98.0
 ELBOW_MIN_DEG     = -115.0   # negative = opening arm (normal operation)
 ELBOW_MAX_DEG     =    0.0   # cannot tuck past IK zero
-WRIST_MIN_DEG     = -200.0
-WRIST_MAX_DEG     =  200.0
+WRIST_MIN_DEG     = -149.0   # physical travel limit (180° - 31° park offset)
+WRIST_MAX_DEG     =   26.0   # physical travel limit (31° park - 5° switch release)
 
 # ── Collision zones ───────────────────────────────────────────────────────────
 MOUNT_RADIUS_MM         = 40.0
-SHOULDER_SWEEP_RADIUS_MM = 84.0   # 44mm DH offset + 40mm pulley radius
+SHOULDER_SWEEP_RADIUS_MM = 78.0   # DH_OFFSET(38) + pulley_radius(40) (updated)
 COLLISION_CLEARANCE_MM  = 10.0
 
 # ── Solver ────────────────────────────────────────────────────────────────────
@@ -244,7 +245,7 @@ def arm_geometry(base_delta: float, shoulder_delta: float,
 
     tp_x = wr_x + TOOL_MM * arm_x
     tp_y = wr_y + TOOL_MM * arm_y
-    tp_z = wr_z
+    tp_z = wr_z + TOOL_Z_OFFSET_MM
 
     return ArmGeometry(
         base     = (0.0,  0.0,  0.0),
@@ -291,7 +292,7 @@ def forward(base_delta: float, shoulder_delta: float, elbow_delta: float) -> FKR
     return FKResult(
         x = sh_x + total_r * arm_x,
         y = sh_y + total_r * arm_y,
-        z = sh_z + elbow_z + wrist_z,
+        z = sh_z + elbow_z + wrist_z + TOOL_Z_OFFSET_MM,
         shoulder_world_deg = _deg(alpha_rad),
         elbow_interior_deg = theta_deg,
         forearm_angle_deg  = _deg(phi_rad),
@@ -299,50 +300,7 @@ def forward(base_delta: float, shoulder_delta: float, elbow_delta: float) -> FKR
 
 
 
-    """
-    Forward kinematics — given joint deltas from IK zero, compute tool tip world position.
 
-    Args:
-        base_delta:     degrees from IK zero, positive = left (CCW from above)
-        shoulder_delta: degrees from IK zero, positive = forward/down
-        elbow_delta:    degrees from IK zero, positive = tuck, negative = open (normal)
-
-    Returns:
-        FKResult with tool tip XYZ in world frame (table origin)
-    """
-    base_rad    = _rad(base_delta)
-    alpha_rad   = _rad(90.0 - shoulder_delta)      # shoulder angle from horizontal
-    theta_deg   = 20.0 - elbow_delta               # elbow interior angle
-    phi_rad     = alpha_rad - math.pi + _rad(theta_deg)  # forearm angle from horizontal
-
-    # Arm direction unit vector in XY plane
-    arm_x = -math.sin(base_rad)   # positive base = left = -X
-    arm_y =  math.cos(base_rad)
-
-    # Shoulder pivot world position
-    sh_x = -SHOULDER_DH_OFFSET_MM * math.sin(base_rad)
-    sh_y =  SHOULDER_DH_OFFSET_MM * math.cos(base_rad)
-    sh_z =  SHOULDER_Z_OFFSET_MM
-
-    # Elbow position relative to shoulder (in r-z plane)
-    elbow_r = L1 * math.cos(alpha_rad)
-    elbow_z = L1 * math.sin(alpha_rad)
-
-    # Wrist position relative to elbow (L2 with DH offset absorbed into BETA)
-    wrist_r = L2 * math.cos(phi_rad + BETA)
-    wrist_z = L2 * math.sin(phi_rad + BETA)
-
-    # Tool extends horizontally from wrist (no Z change, tool always horizontal)
-    total_r = elbow_r + wrist_r + TOOL_MM
-
-    return FKResult(
-        x = sh_x + total_r * arm_x,
-        y = sh_y + total_r * arm_y,
-        z = sh_z + elbow_z + wrist_z,
-        shoulder_world_deg = _deg(alpha_rad),
-        elbow_interior_deg = theta_deg,
-        forearm_angle_deg  = _deg(phi_rad),
-    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -385,11 +343,11 @@ def solve(x: float, y: float, z: float) -> IKResult:
     base_delta = _deg(base_rad)
 
     # ── STAGE 3: Tool compensation ────────────────────────────────────────────
-    # Step back 75mm along base azimuth to get wrist pivot target
-    # Tool is always horizontal so no Z change
+    # Step back along base azimuth to get wrist pivot target
+    # Also remove vertical tool offset to get wrist pivot Z
     wx = x + TOOL_MM * math.sin(base_rad)
     wy = y - TOOL_MM * math.cos(base_rad)
-    wz = z
+    wz = z - TOOL_Z_OFFSET_MM
 
     # ── STAGE 4: Frame conversion to shoulder-pivot frame ────────────────────
     # Shoulder pivot world position at this base angle
@@ -636,7 +594,7 @@ def _run_tests():
     print("\n── Level 3: Workspace & Collision Checks ─────────────────")
 
     # Too far
-    r = solve(0, 400, 300)
+    r = solve(0, 450, 300)
     check("Too far → !reachable", not r.reachable)
     check("Too far → REACH warning", any("REACH" in w for w in r.warnings))
 
